@@ -55,8 +55,93 @@ type Paxos struct {
 
 
 	// Your data here.
+	seqLog map[int]LogVal
+	learnedVal map[int]interface{}
+	minSeq int
+	maxSeq int
 }
 
+type LogVal struct {
+	ProposalNum int // highest proposal have seen
+	AcceptedNum int // accepted proposal number
+	AcceptedVal interface{} // accepted value
+}
+
+type ProposalArgs struct {
+	SeqNum int
+	ProposalNum int
+	ProposalVal interface{}
+}
+
+type ProposalReply struct {
+	SeqNum int
+	ProposalNum int
+	IsProposalNumHigh bool
+	AcceptedNum int
+	AcceptedVal interface{}
+}
+
+type AcceptArgs struct {
+	SeqNum int
+	ProposalNum int
+	ProposalVal interface{}
+}
+
+type AcceptReply struct {
+	HasAccepted bool
+}
+
+func (px *Paxos) Propose(proposalArgs *ProposalArgs, proposalReply *ProposalReply, acceptorAddr string) bool {
+	// You need to separate the difference between unreliable connection and rejection
+	ok := call(acceptorAddr, "Paxos.AcceptorPrepare", proposalArgs, proposalReply)
+	return ok
+}
+
+func (px *Paxos) AcceptorPrepare(proposalArgs *ProposalArgs, proposalReply *ProposalReply ) error{
+	// check minimum sequence number
+	px.mu.Lock()
+	stateVal, ok := px.seqLog[proposalArgs.SeqNum]
+	if ok == false && proposalArgs.SeqNum >= px.minSeq {
+		// the instance does not exist
+		stateVal = LogVal{ProposalNum: -1, AcceptedNum: -1, AcceptedVal: -1}
+	} else if ok == false && proposalArgs.SeqNum < px.minSeq {
+		// return false the sequence number you required is below the threshold
+		proposalReply.SeqNum = -1
+		px.mu.Unlock()
+		return nil
+	}
+	if stateVal.ProposalNum > proposalArgs.ProposalNum {
+		stateVal.ProposalNum = proposalArgs.ProposalNum
+		px.seqLog[proposalArgs.SeqNum] = stateVal //update the proposal number
+		proposalReply.IsProposalNumHigh = true
+	} else { //got rejected proposal number is not high enough
+		proposalReply.IsProposalNumHigh = false
+	}
+	proposalReply.SeqNum = proposalArgs.SeqNum
+	//proposer use this value to check whether is has been accepted
+	proposalReply.ProposalNum = stateVal.ProposalNum
+	proposalReply.AcceptedNum = stateVal.AcceptedNum
+	proposalReply.AcceptedVal = stateVal.AcceptedVal
+	px.mu.Unlock()
+	return nil
+}
+
+func (px *Paxos) AcceptorAccept(acceptArgs *AcceptArgs, acceptReply *AcceptReply ) error{
+	px.mu.Lock()
+	stateVal, ok := px.seqLog[acceptArgs.SeqNum]
+	if ok && acceptArgs.ProposalNum > stateVal.ProposalNum {
+		// If the sequence number is large enough, you accept the proposal and made the update
+		stateVal.ProposalNum = acceptArgs.ProposalNum
+		stateVal.AcceptedNum = acceptArgs.ProposalNum
+		stateVal.AcceptedVal = acceptArgs.ProposalVal
+		px.seqLog[acceptArgs.SeqNum] = stateVal
+		acceptReply.HasAccepted = true
+	} else {
+		acceptReply.HasAccepted = false
+	}
+	px.mu.Unlock()
+	return nil
+}
 //
 // call() sends an RPC to the rpcname handler on server srv
 // with arguments args, waits for the reply, and leaves the
@@ -103,6 +188,83 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 //
 func (px *Paxos) Start(seq int, v interface{}) {
 	// Your code here.
+	// probably need to add a go routine here
+	// make sure to add appropriate lock
+	go func(seq int, v interface{}) {
+		notDecided := true
+		proposedVal := v
+		proposedNum := 0
+		for notDecided == true {
+			acceptCount := 0
+			highestProposalNum := 0
+			highestAcceptedNum := -1
+			var highestAcceptedVal interface{} = nil
+			for idx, addr := range px.peers { // you can also add a go routine here
+				proposeArgs := &ProposalArgs{}
+				proposeArgs.SeqNum = seq
+				proposeArgs.ProposalVal = proposedVal
+				proposeArgs.ProposalNum = proposedNum // learn from the rejection
+				proposeRely := &ProposalReply{SeqNum: -1}
+				// retry for unreliable network, and the max attempts is 10 times
+				if idx == px.me {
+					px.AcceptorPrepare(proposeArgs, proposeRely)
+				} else {
+					for i:= 0; call(addr, "Paxos.AcceptorPrepare", proposeArgs, proposeRely) == false && i < 10; i++ {}
+				}
+				// update the highest accepted number
+				if proposeRely.SeqNum != -1 && proposeRely.IsProposalNumHigh == true && proposeRely.AcceptedNum != -1 {
+					//update a highest proposal number
+					if highestAcceptedNum < proposeRely.AcceptedNum {
+						highestAcceptedVal = proposeRely.AcceptedVal
+						highestAcceptedNum = proposeRely.AcceptedNum
+					}
+				}
+				// check sequence number, and check proposal number
+				if proposeRely.SeqNum != -1 && proposeRely.IsProposalNumHigh == true {
+					acceptCount += 1
+				} else if proposeRely.SeqNum != -1 {
+					//learn the rejected highest sequence num
+					if highestProposalNum < proposeRely.ProposalNum {
+						highestProposalNum = proposeRely.ProposalNum
+					}
+				}
+			}
+			if acceptCount * 2 > len(px.peers) {
+				//accepted by the majority
+				//proceed to the accept phase
+				if highestAcceptedVal != nil {
+					//the proposed val is either your value or the highest proposed value
+					proposedVal = highestAcceptedVal
+				}
+				acceptPhaseCnt := 0
+				for idx, addr := range px.peers {
+					acceptArgs := &AcceptArgs{}
+					acceptReply := &AcceptReply{}
+					acceptArgs.ProposalVal = proposedVal
+					acceptArgs.SeqNum = seq
+					acceptArgs.ProposalNum = proposedNum
+					if idx == px.me {
+						px.AcceptorAccept(acceptArgs, acceptReply)
+					} else {
+						for i:= 0; call(addr, "Paxos.AcceptorAccept", acceptArgs, acceptReply) == false && i < 10; i++ {}
+					}
+					if acceptReply.HasAccepted == true {
+						acceptPhaseCnt += 1
+					}
+				}
+				if acceptPhaseCnt * 2 < len(px.peers) { //the value go accepted by the majority
+					px.mu.Lock()
+					//this is self learned it has been accepted by the majority
+					px.learnedVal[seq] = proposedVal
+					px.mu.Unlock()
+					notDecided = false
+				}
+			} else { //update the proposed num and try it again
+				proposedNum = highestProposalNum + 1 //start the next round of proposal
+			}
+		}
+	}(seq, v)
+	return
 }
 
 //
@@ -167,6 +329,7 @@ func (px *Paxos) Min() int {
 //
 func (px *Paxos) Status(seq int) (Fate, interface{}) {
 	// Your code here.
+	// Danio: so no rpc in this case
 	return Pending, nil
 }
 
@@ -216,7 +379,11 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 
 
 	// Your initialization code here.
-
+	px.seqLog = make(map[int]LogVal)
+	px.learnedVal = make(map[int]interface{})
+	px.minSeq = -1
+	px.maxSeq = -1
+	// end of my initialization
 	if rpcs != nil {
 		// caller will create socket &c
 		rpcs.Register(px)
