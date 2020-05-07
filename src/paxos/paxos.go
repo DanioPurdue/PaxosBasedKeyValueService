@@ -20,7 +20,9 @@ package paxos
 // px.Min() int -- instances before this seq have been forgotten
 //
 
-import "net"
+import (
+	"net"
+)
 import "net/rpc"
 import "log"
 
@@ -91,15 +93,15 @@ type AcceptReply struct {
 	HasAccepted bool
 }
 
-func (px *Paxos) Propose(proposalArgs *ProposalArgs, proposalReply *ProposalReply, acceptorAddr string) bool {
-	// You need to separate the difference between unreliable connection and rejection
-	ok := call(acceptorAddr, "Paxos.AcceptorPrepare", proposalArgs, proposalReply)
-	return ok
+type GetMinLocalArg struct {}
+type GetMinLocalReply struct {
+	minSeq int
 }
 
 func (px *Paxos) AcceptorPrepare(proposalArgs *ProposalArgs, proposalReply *ProposalReply ) error{
 	// check minimum sequence number
 	px.mu.Lock()
+	px.maxSeq = maxH(proposalArgs.SeqNum, px.maxSeq)
 	stateVal, ok := px.seqLog[proposalArgs.SeqNum]
 	if ok == false && proposalArgs.SeqNum >= px.minSeq {
 		// the instance does not exist
@@ -140,6 +142,20 @@ func (px *Paxos) AcceptorAccept(acceptArgs *AcceptArgs, acceptReply *AcceptReply
 		acceptReply.HasAccepted = false
 	}
 	px.mu.Unlock()
+	return nil
+}
+
+func (px *Paxos) AcceptorDecided(acceptArgs *AcceptArgs, acceptReply *AcceptReply ) error{
+	fate, _ := px.Status(acceptArgs.SeqNum)
+	if fate == Pending{
+		// If the system has not learned the value
+		px.mu.Lock()
+		px.learnedVal[acceptArgs.SeqNum] = acceptArgs.ProposalVal
+		px.mu.Unlock()
+		acceptReply.HasAccepted = true
+	} else {
+		acceptReply.HasAccepted = false
+	}
 	return nil
 }
 //
@@ -190,11 +206,15 @@ func (px *Paxos) Start(seq int, v interface{}) {
 	// Your code here.
 	// probably need to add a go routine here
 	// make sure to add appropriate lock
+	px.mu.Lock()
+	px.maxSeq = maxH(seq, px.maxSeq)
+	px.mu.Unlock()
+
 	go func(seq int, v interface{}) {
 		notDecided := true
 		proposedVal := v
 		proposedNum := 0
-		for notDecided == true {
+		for notDecided == true && px.isdead() == false {
 			acceptCount := 0
 			highestProposalNum := 0
 			highestAcceptedNum := -1
@@ -253,10 +273,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
 					}
 				}
 				if acceptPhaseCnt * 2 < len(px.peers) { //the value go accepted by the majority
-					px.mu.Lock()
-					//this is self learned it has been accepted by the majority
-					px.learnedVal[seq] = proposedVal
-					px.mu.Unlock()
+					px.BcastLearnedValue(seq, v)
 					notDecided = false
 				}
 			} else { //update the proposed num and try it again
@@ -267,6 +284,28 @@ func (px *Paxos) Start(seq int, v interface{}) {
 	return
 }
 
+func (px *Paxos) BcastLearnedValue(seq int, v interface{}) {
+	for idx, addr := range px.peers {
+		if idx == px.me {
+			px.mu.Lock()
+			//this is self learned it has been accepted by the majority
+			px.learnedVal[seq] = v
+			px.mu.Unlock()
+		} else {
+			acceptArgs := &AcceptArgs{}
+			acceptArgs.SeqNum = seq
+			acceptArgs.ProposalVal = v
+			acceptReply := &AcceptReply{}
+			for i := 0; i < 10; i++ { // try to broadcast the value and give the maximum of 10 trial
+				res := call(addr, "Paxos.AcceptorDecided", acceptArgs, acceptReply)
+				if res == true {
+					break
+				}
+			}
+		}
+	}
+}
+
 //
 // the application on this machine is done with
 // all instances <= seq.
@@ -274,7 +313,14 @@ func (px *Paxos) Start(seq int, v interface{}) {
 // see the comments for Min() for more explanation.
 //
 func (px *Paxos) Done(seq int) {
-	// Your code here.
+	px.mu.Lock()
+	// Your code here
+	for i := px.minSeq; i <= seq; i++ {
+		delete(px.learnedVal, i)
+		delete(px.seqLog, i)
+	}
+	px.minSeq = maxH(seq + 1, px.minSeq)
+	px.mu.Unlock()
 }
 
 //
@@ -284,7 +330,7 @@ func (px *Paxos) Done(seq int) {
 //
 func (px *Paxos) Max() int {
 	// Your code here.
-	return 0
+	return px.maxSeq
 }
 
 //
@@ -315,9 +361,41 @@ func (px *Paxos) Max() int {
 // missed -- the other peers therefor cannot forget these
 // instances.
 //
+
+func minH (a int, b int) int {
+	if a < b {return a}
+	return b
+}
+
+func maxH (a int, b int) int {
+	if a > b {return a}
+	return b
+}
+
 func (px *Paxos) Min() int {
 	// You code here.
-	return 0
+	minVal := px.minSeq
+	for idx, addr := range px.peers {
+		if idx == px.me {
+			continue
+		} else {
+			getMinLocalArg := &GetMinLocalArg{}
+			getMinLocalReply := &GetMinLocalReply{}
+			for i:=0; i < 10; i++{
+				isConnected := call(addr,"Paxos.GetMinLocal", getMinLocalArg, getMinLocalReply)
+				if isConnected == true {
+					minVal = minH(minVal, getMinLocalReply.minSeq)
+					break
+				}
+			}
+		}
+	}
+	return minVal
+}
+
+func (px *Paxos) GetMinLocal(getMinLocalArg *GetMinLocalArg, getMinLocalReply *GetMinLocalReply ) error {
+	getMinLocalReply.minSeq = px.minSeq
+	return nil
 }
 
 //
@@ -329,8 +407,20 @@ func (px *Paxos) Min() int {
 //
 func (px *Paxos) Status(seq int) (Fate, interface{}) {
 	// Your code here.
-	// Danio: so no rpc in this case
-	return Pending, nil
+	var fate Fate
+	px.mu.Lock()
+	if seq < px.minSeq {
+		fate = Forgotten
+	} else {
+		_, ok := px.learnedVal[seq]
+		if ok {
+			fate = Decided
+		} else {
+			fate = Pending
+		}
+	}
+	px.mu.Unlock()
+	return fate, nil
 }
 
 
