@@ -112,8 +112,8 @@ func (px *Paxos) AcceptorPrepare(proposalArgs *ProposalArgs, proposalReply *Prop
 		px.mu.Unlock()
 		return nil
 	}
-	if stateVal.ProposalNum > proposalArgs.ProposalNum {
-		stateVal.ProposalNum = proposalArgs.ProposalNum
+	if proposalArgs.ProposalNum > stateVal.ProposalNum {
+		stateVal.ProposalNum = proposalArgs.ProposalNum // update the highest proposal number seen so far
 		px.seqLog[proposalArgs.SeqNum] = stateVal //update the proposal number
 		proposalReply.IsProposalNumHigh = true
 	} else { //got rejected proposal number is not high enough
@@ -131,7 +131,7 @@ func (px *Paxos) AcceptorPrepare(proposalArgs *ProposalArgs, proposalReply *Prop
 func (px *Paxos) AcceptorAccept(acceptArgs *AcceptArgs, acceptReply *AcceptReply ) error{
 	px.mu.Lock()
 	stateVal, ok := px.seqLog[acceptArgs.SeqNum]
-	if ok && acceptArgs.ProposalNum > stateVal.ProposalNum {
+	if ok && acceptArgs.ProposalNum >= stateVal.ProposalNum {
 		// If the sequence number is large enough, you accept the proposal and made the update
 		stateVal.ProposalNum = acceptArgs.ProposalNum
 		stateVal.AcceptedNum = acceptArgs.ProposalNum
@@ -206,16 +206,12 @@ func (px *Paxos) Start(seq int, v interface{}) {
 	// Your code here.
 	// probably need to add a go routine here
 	// make sure to add appropriate lock
-	px.mu.Lock()
-	px.maxSeq = maxH(seq, px.maxSeq)
-	px.mu.Unlock()
-
 	go func(seq int, v interface{}) {
 		notDecided := true
 		proposedVal := v
 		proposedNum := 0
 		for notDecided == true && px.isdead() == false {
-			acceptCount := 0
+			acceptCount := 0 // number acceptors that have accepted the values
 			highestProposalNum := 0
 			highestAcceptedNum := -1
 			var highestAcceptedVal interface{} = nil
@@ -231,9 +227,9 @@ func (px *Paxos) Start(seq int, v interface{}) {
 				} else {
 					for i:= 0; call(addr, "Paxos.AcceptorPrepare", proposeArgs, proposeRely) == false && i < 10; i++ {}
 				}
-				// update the highest accepted number
+				// Update the highest accepted proposal number
 				if proposeRely.SeqNum != -1 && proposeRely.IsProposalNumHigh == true && proposeRely.AcceptedNum != -1 {
-					//update a highest proposal number
+					// Update the highest accepted number, if it has a proposal number
 					if highestAcceptedNum < proposeRely.AcceptedNum {
 						highestAcceptedVal = proposeRely.AcceptedVal
 						highestAcceptedNum = proposeRely.AcceptedNum
@@ -242,13 +238,14 @@ func (px *Paxos) Start(seq int, v interface{}) {
 				// check sequence number, and check proposal number
 				if proposeRely.SeqNum != -1 && proposeRely.IsProposalNumHigh == true {
 					acceptCount += 1
-				} else if proposeRely.SeqNum != -1 {
-					//learn the rejected highest sequence num
+				} else if proposeRely.SeqNum != -1 { // under the assumption that RPC made it through
+					// learn the rejected highest sequence num
 					if highestProposalNum < proposeRely.ProposalNum {
 						highestProposalNum = proposeRely.ProposalNum
 					}
 				}
 			}
+			/* Accept Phase */
 			if acceptCount * 2 > len(px.peers) {
 				//accepted by the majority
 				//proceed to the accept phase
@@ -259,21 +256,24 @@ func (px *Paxos) Start(seq int, v interface{}) {
 				acceptPhaseCnt := 0
 				for idx, addr := range px.peers {
 					acceptArgs := &AcceptArgs{}
-					acceptReply := &AcceptReply{}
+					acceptReply := &AcceptReply{HasAccepted: false}
 					acceptArgs.ProposalVal = proposedVal
 					acceptArgs.SeqNum = seq
 					acceptArgs.ProposalNum = proposedNum
 					if idx == px.me {
 						px.AcceptorAccept(acceptArgs, acceptReply)
 					} else {
+						//TODO::time.Sleep(1 * time.Second) can be used to avoid conjestion
 						for i:= 0; call(addr, "Paxos.AcceptorAccept", acceptArgs, acceptReply) == false && i < 10; i++ {}
 					}
 					if acceptReply.HasAccepted == true {
 						acceptPhaseCnt += 1
 					}
 				}
+				/* Learn Phase */
 				if acceptPhaseCnt * 2 < len(px.peers) { //the value go accepted by the majority
-					px.BcastLearnedValue(seq, v)
+					//TODO:: have the learner to periodically to learn from the majority
+					px.BcastLearnedValue(seq, proposedVal)
 					notDecided = false
 				}
 			} else { //update the proposed num and try it again
@@ -286,22 +286,14 @@ func (px *Paxos) Start(seq int, v interface{}) {
 
 func (px *Paxos) BcastLearnedValue(seq int, v interface{}) {
 	for idx, addr := range px.peers {
+		acceptArgs := &AcceptArgs{}
+		acceptArgs.SeqNum = seq
+		acceptArgs.ProposalVal = v
+		acceptReply := &AcceptReply{}
 		if idx == px.me {
-			px.mu.Lock()
-			//this is self learned it has been accepted by the majority
-			px.learnedVal[seq] = v
-			px.mu.Unlock()
+			px.AcceptorDecided(acceptArgs, acceptReply)
 		} else {
-			acceptArgs := &AcceptArgs{}
-			acceptArgs.SeqNum = seq
-			acceptArgs.ProposalVal = v
-			acceptReply := &AcceptReply{}
-			for i := 0; i < 10; i++ { // try to broadcast the value and give the maximum of 10 trial
-				res := call(addr, "Paxos.AcceptorDecided", acceptArgs, acceptReply)
-				if res == true {
-					break
-				}
-			}
+			for i := 0; i < 10 && call(addr, "Paxos.AcceptorDecided", acceptArgs, acceptReply) == false; i++ {}// try to broadcast the value and give the maximum of 10 trial
 		}
 	}
 }
@@ -362,6 +354,7 @@ func (px *Paxos) Max() int {
 // instances.
 //
 
+// Helper functions
 func minH (a int, b int) int {
 	if a < b {return a}
 	return b
@@ -371,6 +364,7 @@ func maxH (a int, b int) int {
 	if a > b {return a}
 	return b
 }
+// End of helper functions
 
 func (px *Paxos) Min() int {
 	// You code here.
