@@ -22,6 +22,7 @@ package paxos
 
 import (
 	"net"
+	"time"
 )
 import "net/rpc"
 import "log"
@@ -96,6 +97,16 @@ type AcceptReply struct {
 type GetMinLocalArg struct {}
 type GetMinLocalReply struct {
 	MinSeq int
+}
+
+type LearnerArgs struct{
+	SeqNum int
+}
+
+type LearnerReply struct{
+	SeqNum int
+	HasAccepted bool
+	AcceptedVal interface{}
 }
 
 func (px *Paxos) AcceptorPrepare(proposalArgs *ProposalArgs, proposalReply *ProposalReply ) error{
@@ -460,7 +471,55 @@ func (px *Paxos) setunreliable(what bool) {
 func (px *Paxos) isunreliable() bool {
 	return atomic.LoadInt32(&px.unreliable) != 0
 }
+//
+//
+// Description: called whenever an acceptor accept something and it does not know whether this is majority
+//
+func (px *Paxos) learnerPropose(seq int) {
+	//sleep a bit to allow for the unreliable network
+	time.Sleep(time.Millisecond)
+	//check for unreliable network
+	px.mu.Lock()
+	_, lOk := px.learnedVal[seq]
+	px.mu.Unlock()
+	if lOk == true {
+		// the value has been learned don't bother as well
+		return
+	}
+	//now let's learn the value
+	stats := make(map[interface{}]int)
+	for idx, addr := range px.peers {
+		learnerArgs := &LearnerArgs{SeqNum: seq}
+		learnerReply := &LearnerReply{}
+		if idx == px.me {
+			px.LearnerLearn(learnerArgs, learnerReply)
+		} else {
+			for i := 0; i < 10 && px.isdead() == false && (call(addr, "Paxos.LearnerLearn", learnerArgs, learnerReply) == false); i++ {}
+		}
+		if learnerReply.SeqNum == -1 && learnerReply.HasAccepted == false {
+			continue
+		}
+		_, ok := stats[learnerReply.AcceptedVal]
+		if ok {
+			stats[learnerReply.AcceptedVal] = 1
+		} else {
+			stats[learnerReply.AcceptedVal] += 1
+		}
+	}
+	for val, cnt := range stats {
+		if cnt * 2 <= len(px.peers) {
+			continue
+		}
+		// there is a majority and update the part.
+		px.mu.Lock()
+		px.learnedVal[seq] = val
+		px.mu.Unlock()
+	}
+}
 
+func (px *Paxos) LearnerLearn(learnerArgs *LearnerArgs, learnerReply *LearnerReply) error {
+	return nil
+}
 //
 // the application wants to create a paxos peer.
 // the ports of all the paxos peers (including this one)
@@ -493,7 +552,8 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 			log.Fatal("listen error: ", e)
 		}
 		px.l = l
-
+		// Learner
+		// End of Learner
 		// please do not change any of the following code,
 		// or do anything to subvert it.
 
