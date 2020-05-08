@@ -95,7 +95,7 @@ type AcceptReply struct {
 
 type GetMinLocalArg struct {}
 type GetMinLocalReply struct {
-	minSeq int
+	MinSeq int
 }
 
 func (px *Paxos) AcceptorPrepare(proposalArgs *ProposalArgs, proposalReply *ProposalReply ) error{
@@ -116,14 +116,15 @@ func (px *Paxos) AcceptorPrepare(proposalArgs *ProposalArgs, proposalReply *Prop
 		stateVal.ProposalNum = proposalArgs.ProposalNum // update the highest proposal number seen so far
 		px.seqLog[proposalArgs.SeqNum] = stateVal //update the proposal number
 		proposalReply.IsProposalNumHigh = true
+		//fmt.Println("AccepterPrepare | proposal accepted Proposal Number: ", proposalArgs.ProposalNum, " sequence number: ", proposalArgs.SeqNum)
 	} else { //got rejected proposal number is not high enough
 		proposalReply.IsProposalNumHigh = false
 	}
-	proposalReply.SeqNum = proposalArgs.SeqNum
-	//proposer use this value to check whether is has been accepted
+	proposalReply.SeqNum = proposalArgs.SeqNum //proposer check the sequence number
 	proposalReply.ProposalNum = stateVal.ProposalNum
 	proposalReply.AcceptedNum = stateVal.AcceptedNum
 	proposalReply.AcceptedVal = stateVal.AcceptedVal
+	//fmt.Println("AccepterPrepare | sequence number (right before return): ", proposalReply.SeqNum)
 	px.mu.Unlock()
 	return nil
 }
@@ -220,32 +221,36 @@ func (px *Paxos) Start(seq int, v interface{}) {
 				proposeArgs.SeqNum = seq
 				proposeArgs.ProposalVal = proposedVal
 				proposeArgs.ProposalNum = proposedNum // learn from the rejection
-				proposeRely := &ProposalReply{SeqNum: -1}
+				proposalReply := &ProposalReply{}
+				//proposalReply.SeqNum = -1
 				// retry for unreliable network, and the max attempts is 10 times
 				if idx == px.me {
-					px.AcceptorPrepare(proposeArgs, proposeRely)
+					px.AcceptorPrepare(proposeArgs, proposalReply)
 				} else {
-					for i:= 0; call(addr, "Paxos.AcceptorPrepare", proposeArgs, proposeRely) == false && i < 10; i++ {}
+					for i:= 0; (call(addr, "Paxos.AcceptorPrepare", proposeArgs, proposalReply) == false) && (i < 10) && px.isdead() == false; i++ {}
 				}
 				// Update the highest accepted proposal number
-				if proposeRely.SeqNum != -1 && proposeRely.IsProposalNumHigh == true && proposeRely.AcceptedNum != -1 {
+				if proposalReply.SeqNum != -1 && proposalReply.IsProposalNumHigh == true && proposalReply.AcceptedNum != -1 {
 					// Update the highest accepted number, if it has a proposal number
-					if highestAcceptedNum < proposeRely.AcceptedNum {
-						highestAcceptedVal = proposeRely.AcceptedVal
-						highestAcceptedNum = proposeRely.AcceptedNum
+					if highestAcceptedNum < proposalReply.AcceptedNum {
+						highestAcceptedVal = proposalReply.AcceptedVal
+						highestAcceptedNum = proposalReply.AcceptedNum
 					}
 				}
 				// check sequence number, and check proposal number
-				if proposeRely.SeqNum != -1 && proposeRely.IsProposalNumHigh == true {
+				//fmt.Println("proposer side SeqNum: ", proposalReply.SeqNum, " IsProposalNumHigh: ", proposalReply.IsProposalNumHigh)
+				if proposalReply.SeqNum != -1 && proposalReply.IsProposalNumHigh == true {
+					//fmt.Println("accept count getUpdated")
 					acceptCount += 1
-				} else if proposeRely.SeqNum != -1 { // under the assumption that RPC made it through
+				} else if proposalReply.SeqNum != -1 { // under the assumption that RPC made it through
 					// learn the rejected highest sequence num
-					if highestProposalNum < proposeRely.ProposalNum {
-						highestProposalNum = proposeRely.ProposalNum
+					if highestProposalNum < proposalReply.ProposalNum {
+						highestProposalNum = proposalReply.ProposalNum
 					}
 				}
 			}
 			/* Accept Phase */
+			//fmt.Println("Entering the accept phase... acceptCount: ", acceptCount, " peer size: ", len(px.peers))
 			if acceptCount * 2 > len(px.peers) {
 				//accepted by the majority
 				//proceed to the accept phase
@@ -256,7 +261,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
 				acceptPhaseCnt := 0
 				for idx, addr := range px.peers {
 					acceptArgs := &AcceptArgs{}
-					acceptReply := &AcceptReply{HasAccepted: false}
+					acceptReply := &AcceptReply{}
 					acceptArgs.ProposalVal = proposedVal
 					acceptArgs.SeqNum = seq
 					acceptArgs.ProposalNum = proposedNum
@@ -264,14 +269,15 @@ func (px *Paxos) Start(seq int, v interface{}) {
 						px.AcceptorAccept(acceptArgs, acceptReply)
 					} else {
 						//TODO::time.Sleep(1 * time.Second) can be used to avoid conjestion
-						for i:= 0; call(addr, "Paxos.AcceptorAccept", acceptArgs, acceptReply) == false && i < 10; i++ {}
+						for i:= 0; call(addr, "Paxos.AcceptorAccept", acceptArgs, acceptReply) == false && i < 10 && px.isdead() == false; i++ {}
 					}
 					if acceptReply.HasAccepted == true {
 						acceptPhaseCnt += 1
 					}
 				}
 				/* Learn Phase */
-				if acceptPhaseCnt * 2 < len(px.peers) { //the value go accepted by the majority
+				//fmt.Println("Entering the learn phase | acceptPhaseCnt: ", acceptPhaseCnt)
+				if acceptPhaseCnt * 2 > len(px.peers) { //the value go accepted by the majority
 					//TODO:: have the learner to periodically to learn from the majority
 					px.BcastLearnedValue(seq, proposedVal)
 					notDecided = false
@@ -293,7 +299,7 @@ func (px *Paxos) BcastLearnedValue(seq int, v interface{}) {
 		if idx == px.me {
 			px.AcceptorDecided(acceptArgs, acceptReply)
 		} else {
-			for i := 0; i < 10 && call(addr, "Paxos.AcceptorDecided", acceptArgs, acceptReply) == false; i++ {}// try to broadcast the value and give the maximum of 10 trial
+			for i := 0; i < 10 && px.isdead() == false && call(addr, "Paxos.AcceptorDecided", acceptArgs, acceptReply) == false; i++ {}// try to broadcast the value and give the maximum of 10 trial
 		}
 	}
 }
@@ -375,20 +381,24 @@ func (px *Paxos) Min() int {
 		} else {
 			getMinLocalArg := &GetMinLocalArg{}
 			getMinLocalReply := &GetMinLocalReply{}
-			for i:=0; i < 10; i++{
+			for i:=0; i < 10 && px.isdead() == false; i++{
 				isConnected := call(addr,"Paxos.GetMinLocal", getMinLocalArg, getMinLocalReply)
 				if isConnected == true {
-					minVal = minH(minVal, getMinLocalReply.minSeq)
+					minVal = minH(minVal, getMinLocalReply.MinSeq)
+					//fmt.Println("Testing Min | minVal: ", minVal)
 					break
 				}
 			}
 		}
 	}
+	if minVal == -1 {
+		minVal = 0
+	}
 	return minVal
 }
 
 func (px *Paxos) GetMinLocal(getMinLocalArg *GetMinLocalArg, getMinLocalReply *GetMinLocalReply ) error {
-	getMinLocalReply.minSeq = px.minSeq
+	getMinLocalReply.MinSeq = px.minSeq
 	return nil
 }
 
