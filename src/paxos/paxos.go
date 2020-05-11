@@ -150,6 +150,7 @@ func (px *Paxos) AcceptorAccept(acceptArgs *AcceptArgs, acceptReply *AcceptReply
 		stateVal.AcceptedVal = acceptArgs.ProposalVal
 		px.seqLog[acceptArgs.SeqNum] = stateVal
 		acceptReply.HasAccepted = true
+		go px.learnerPropose(acceptArgs.SeqNum)
 	} else {
 		acceptReply.HasAccepted = false
 	}
@@ -477,47 +478,64 @@ func (px *Paxos) isunreliable() bool {
 //
 func (px *Paxos) learnerPropose(seq int) {
 	//sleep a bit to allow for the unreliable network
-	time.Sleep(time.Millisecond)
 	//check for unreliable network
-	px.mu.Lock()
-	_, lOk := px.learnedVal[seq]
-	px.mu.Unlock()
-	if lOk == true {
-		// the value has been learned don't bother as well
-		return
-	}
-	//now let's learn the value
-	stats := make(map[interface{}]int)
-	for idx, addr := range px.peers {
-		learnerArgs := &LearnerArgs{SeqNum: seq}
-		learnerReply := &LearnerReply{}
-		if idx == px.me {
-			px.LearnerLearn(learnerArgs, learnerReply)
-		} else {
-			for i := 0; i < 10 && px.isdead() == false && (call(addr, "Paxos.LearnerLearn", learnerArgs, learnerReply) == false); i++ {}
-		}
-		if learnerReply.SeqNum == -1 && learnerReply.HasAccepted == false {
-			continue
-		}
-		_, ok := stats[learnerReply.AcceptedVal]
-		if ok {
-			stats[learnerReply.AcceptedVal] = 1
-		} else {
-			stats[learnerReply.AcceptedVal] += 1
-		}
-	}
-	for val, cnt := range stats {
-		if cnt * 2 <= len(px.peers) {
-			continue
-		}
-		// there is a majority and update the part.
+	isLearned := false
+	for isLearned == false {
+		time.Sleep(time.Millisecond)
 		px.mu.Lock()
-		px.learnedVal[seq] = val
+		_, lOk := px.learnedVal[seq]
 		px.mu.Unlock()
+		if lOk == true {
+			// the value has been learned don't bother as well
+			isLearned = true
+		} else {
+			//now let's learn the value
+			stats := make(map[interface{}]int)
+			for idx, addr := range px.peers {
+				learnerArgs := &LearnerArgs{SeqNum: seq}
+				learnerReply := &LearnerReply{}
+				if idx == px.me {
+					px.LearnerLearn(learnerArgs, learnerReply)
+				} else {
+					for i := 0; i < 10 && px.isdead() == false && (call(addr, "Paxos.LearnerLearn", learnerArgs, learnerReply) == false); i++ {}
+				}
+				if learnerReply.SeqNum == -1 || learnerReply.HasAccepted == false {
+					continue
+				}
+				_, ok := stats[learnerReply.AcceptedVal]
+				if ok == false {
+					stats[learnerReply.AcceptedVal] = 1
+				} else {
+					stats[learnerReply.AcceptedVal] += 1
+				}
+			}
+			for val, cnt := range stats {
+				if cnt * 2 <= len(px.peers) {
+					continue
+				}
+				// there is a majority and update the part.
+				px.mu.Lock()
+				px.learnedVal[seq] = val
+				px.mu.Unlock()
+				isLearned = true
+				break
+			}
+		}
 	}
 }
 
 func (px *Paxos) LearnerLearn(learnerArgs *LearnerArgs, learnerReply *LearnerReply) error {
+	px.mu.Lock()
+	stateVal, ok := px.seqLog[learnerArgs.SeqNum]
+	px.mu.Unlock()
+	learnerReply.SeqNum = learnerArgs.SeqNum
+	// If the sequence number does not exist or there is accepted number
+	if ok == false || stateVal.AcceptedNum == -1 {
+		learnerReply.HasAccepted = false
+	} else {
+		learnerReply.HasAccepted = true
+		learnerReply.AcceptedVal = stateVal.AcceptedVal
+	}
 	return nil
 }
 //
