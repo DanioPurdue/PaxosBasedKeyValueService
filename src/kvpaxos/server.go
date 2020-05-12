@@ -1,10 +1,14 @@
 package kvpaxos
 
-import "net"
+import (
+	"net"
+	"time"
+)
 import "fmt"
 import "net/rpc"
 import "log"
 import "paxos"
+//import "../paxos"
 import "sync"
 import "sync/atomic"
 import "os"
@@ -27,6 +31,12 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	IsPut bool
+	IsAppend bool
+	IsGet bool
+	IsNoOp bool
+	OpKey string //this is shared by all three types of operations
+	OpVal string
 }
 
 type KVPaxos struct {
@@ -38,17 +48,160 @@ type KVPaxos struct {
 	px         *paxos.Paxos
 
 	// Your definitions here.
+	seq		   int
+	str2str    map[string]string
+	reqHist    map[int64]bool
 }
 
 
 func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 	// Your code here.
+	// Check the request code to see whether it has been applied or not
+	// If it has not applied then start a new sequence
+	// Your code here.
+	//Duplicate Client Request: If you submit the request to the same machine, this will prevent you from
+	//Issuing the request at the first place.
+	kv.mu.Lock()
+	if kv.reqHist[args.ReqCode] == true {
+		// Operation has been applied
+		reply.Err = ""
+		kv.mu.Unlock()
+		return nil
+	}
+	kv.mu.Unlock()
+
+	// This server got the operation this request is received for the first time.
+	kv.reqHist[args.ReqCode] = true
+	// Prepare the operation
+	var op Op
+	op = Op{IsPut: false, IsAppend: false, IsGet: true, IsNoOp: false, OpKey: args.Key, OpVal:""}
+	isSettled := false
+	to := 10 * time.Millisecond
+	for isSettled == false {
+		kv.mu.Lock()
+		seqNum := kv.seq
+		kv.px.Start(seqNum, op)
+		//update the sequence number
+		kv.seq += 1
+		kv.mu.Unlock()
+
+		//check whether the server is deaded
+		if kv.isdead()== true {
+			reply.Err = "server is down"
+			return nil
+		}
+		for {
+			status, learnedVal := kv.px.Status(seqNum)
+			if status == paxos.Decided {
+				learnedOp, _ := learnedVal.(Op)
+				if learnedOp.OpKey != op.OpKey {
+					// operation key avoid duplicated action
+					// The proposed sequence number proposed by you has not been accepted
+					// increase the sequence number
+					break
+				}
+				//check all the previous ops
+				minSeq := kv.px.Min()
+				isReady := false
+				for isReady == false {
+					isReady = true
+					//check whether previous status has been accepted
+					for i := minSeq ; i < seqNum; i++ {
+						status, _ := kv.px.Status(i)
+						if status != paxos.Decided {
+							isReady = false
+						}
+					}
+				}
+				kv.mu.Lock()
+				kv.px.Done(seqNum) //free the unused memory
+				reply.Value = kv.str2str[args.Key]
+				kv.mu.Unlock()
+				reply.Err = ""
+				return nil
+			}
+			time.Sleep(to)
+			if to < 10 * time.Second {
+				to *= 2
+			}
+		}
+	}
 	return nil
 }
 
 func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	// Your code here.
+	//Duplicate Client Request: If you submit the request to the same machine, this will prevent you from
+	//Issuing the request at the first place.
+	kv.mu.Lock()
+	if kv.reqHist[args.ReqCode] == true {
+		// Operation has been applied
+		reply.Err = ""
+		kv.mu.Unlock()
+		return nil
+	}
+	kv.mu.Unlock()
 
+	// This server got the operation this request is received for the first time.
+	kv.reqHist[args.ReqCode] = true
+	// Prepare the operation
+	var op Op
+	if args.Op == "Put" {
+		op = Op{IsPut: true, IsAppend: false, IsGet: false, IsNoOp: false, OpKey: args.Key, OpVal: args.Value}
+	} else if args.Op == "Append" {
+		op = Op{IsPut: true, IsAppend: false, IsGet: false, IsNoOp: false, OpKey: args.Key, OpVal: args.Value}
+	}
+
+	isSettled := false
+	to := 10 * time.Millisecond
+	for isSettled == false {
+		kv.mu.Lock()
+		seqNum := kv.seq
+		kv.px.Start(seqNum, op)
+		//update the sequence number
+		kv.seq += 1
+		kv.mu.Unlock()
+
+
+		for {
+			status, learnedVal := kv.px.Status(seqNum)
+			if status == paxos.Decided {
+				learnedOp, _ := learnedVal.(Op)
+				if learnedOp.OpKey != op.OpKey { //operation key avoid duplicated action
+					// The proposed sequence number proposed by you has not been accepted
+					// increase the sequence number
+					break
+				}
+				//check all the previous ops
+				minSeq := kv.px.Min()
+				isReady := false
+				for isReady == false {
+					isReady = true
+					//check whether previous status has been accepted
+					for i := minSeq ; i < seqNum; i++ {
+						status, _ := kv.px.Status(i)
+						if status != paxos.Decided {
+							isReady = false
+						}
+					}
+				}
+				kv.mu.Lock()
+				if op.IsPut {
+					kv.str2str[op.OpKey] = op.OpVal
+				} else if op.IsAppend {
+					kv.str2str[op.OpKey] += kv.str2str[op.OpKey] + op.OpVal
+				}
+				kv.px.Done(seqNum)
+				kv.mu.Unlock()
+				reply.Err = ""
+				return nil
+			}
+			time.Sleep(to)
+			if to < 10 * time.Second {
+				to *= 2
+			}
+		}
+	}
 	return nil
 }
 
@@ -94,7 +247,9 @@ func StartServer(servers []string, me int) *KVPaxos {
 	kv.me = me
 
 	// Your initialization code here.
-
+	kv.str2str = make(map[string]string)
+	kv.reqHist = make(map[int64]bool)
+	kv.seq = 0
 	rpcs := rpc.NewServer()
 	rpcs.Register(kv)
 

@@ -109,6 +109,7 @@ type LearnerReply struct{
 	AcceptedVal interface{}
 }
 
+
 func (px *Paxos) AcceptorPrepare(proposalArgs *ProposalArgs, proposalReply *ProposalReply ) error{
 	// check minimum sequence number
 	px.mu.Lock()
@@ -424,18 +425,23 @@ func (px *Paxos) GetMinLocal(getMinLocalArg *GetMinLocalArg, getMinLocalReply *G
 func (px *Paxos) Status(seq int) (Fate, interface{}) {
 	// Your code here.
 	var fate Fate
+	var val interface{}
 	px.mu.Lock()
 	if seq < px.minSeq {
 		fate = Forgotten
 	} else {
-		_, ok := px.learnedVal[seq]
+		learnedVal, ok := px.learnedVal[seq]
 		if ok {
 			fate = Decided
+			val = learnedVal
 		} else {
 			fate = Pending
 		}
 	}
 	px.mu.Unlock()
+	if fate == Decided {
+		return fate, val
+	}
 	return fate, nil
 }
 
