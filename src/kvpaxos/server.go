@@ -37,6 +37,7 @@ type Op struct {
 	IsNoOp bool
 	OpKey string //this is shared by all three types of operations
 	OpVal string
+	OpCode int64
 }
 
 type KVPaxos struct {
@@ -74,9 +75,10 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 	kv.reqHist[args.ReqCode] = true
 	// Prepare the operation
 	var op Op
-	op = Op{IsPut: false, IsAppend: false, IsGet: true, IsNoOp: false, OpKey: args.Key, OpVal:""}
+	op = Op{IsPut: false, IsAppend: false, IsGet: true, IsNoOp: false, OpKey: args.Key, OpVal:"", OpCode: args.ReqCode}
 	isSettled := false
 	to := 10 * time.Millisecond
+
 	for isSettled == false {
 		kv.mu.Lock()
 		seqNum := kv.seq
@@ -84,7 +86,7 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 		//update the sequence number
 		kv.seq += 1
 		kv.mu.Unlock()
-
+		fmt.Println("Get | Started SeqNum: ", seqNum, " reqCode: ", args.ReqCode)
 		//check whether the server is deaded
 		if kv.isdead()== true {
 			reply.Err = "server is down"
@@ -94,10 +96,12 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 			status, learnedVal := kv.px.Status(seqNum)
 			if status == paxos.Decided {
 				learnedOp, _ := learnedVal.(Op)
-				if learnedOp.OpKey != op.OpKey {
+				if learnedOp.OpCode != op.OpCode {
 					// operation key avoid duplicated action
 					// The proposed sequence number proposed by you has not been accepted
 					// increase the sequence number
+					fmt.Print("catching up:")
+					kv.applyOp(learnedOp)
 					break
 				}
 				//check all the previous ops
@@ -108,14 +112,14 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 					//check whether previous status has been accepted
 					for i := minSeq ; i < seqNum; i++ {
 						status, _ := kv.px.Status(i)
-						if status != paxos.Decided {
+						if status == paxos.Pending {
 							isReady = false
 						}
 					}
 				}
+				reply.Value = kv.applyOp(op)
 				kv.mu.Lock()
 				kv.px.Done(seqNum) //free the unused memory
-				reply.Value = kv.str2str[args.Key]
 				kv.mu.Unlock()
 				reply.Err = ""
 				return nil
@@ -147,9 +151,9 @@ func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	// Prepare the operation
 	var op Op
 	if args.Op == "Put" {
-		op = Op{IsPut: true, IsAppend: false, IsGet: false, IsNoOp: false, OpKey: args.Key, OpVal: args.Value}
+		op = Op{IsPut: true, IsAppend: false, IsGet: false, IsNoOp: false, OpKey: args.Key, OpVal: args.Value, OpCode: args.ReqCode}
 	} else if args.Op == "Append" {
-		op = Op{IsPut: true, IsAppend: false, IsGet: false, IsNoOp: false, OpKey: args.Key, OpVal: args.Value}
+		op = Op{IsPut: false, IsAppend: true, IsGet: false, IsNoOp: false, OpKey: args.Key, OpVal: args.Value, OpCode: args.ReqCode}
 	}
 
 	isSettled := false
@@ -162,35 +166,39 @@ func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 		kv.seq += 1
 		kv.mu.Unlock()
 
-
-		for {
+		fmt.Println("PutAppend | Started SeqNum: ", seqNum, " reqCode: ", args.ReqCode)
+		for kv.isdead() == false {
 			status, learnedVal := kv.px.Status(seqNum)
-			if status == paxos.Decided {
+			fmt.Println("PutAppend | seqNum: ", seqNum, " status: ", status)
+			if status != paxos.Pending { //either decided or forgotten
 				learnedOp, _ := learnedVal.(Op)
-				if learnedOp.OpKey != op.OpKey { //operation key avoid duplicated action
+				if status == paxos.Forgotten || learnedOp.OpCode != op.OpCode {
+					// operation key avoid duplicated action
 					// The proposed sequence number proposed by you has not been accepted
 					// increase the sequence number
+					fmt.Print("catching up:")
+					if status == paxos.Decided {
+						kv.applyOp(learnedOp) //catching up the operation
+					}
 					break
 				}
 				//check all the previous ops
 				minSeq := kv.px.Min()
+				fmt.Println("current is Decided | minSeq: ", minSeq, " current Seq: ", seqNum)
 				isReady := false
 				for isReady == false {
 					isReady = true
 					//check whether previous status has been accepted
 					for i := minSeq ; i < seqNum; i++ {
 						status, _ := kv.px.Status(i)
-						if status != paxos.Decided {
+						if status == paxos.Pending{
 							isReady = false
 						}
 					}
 				}
+				fmt.Println("About to return from putAppend")
+				kv.applyOp(op)
 				kv.mu.Lock()
-				if op.IsPut {
-					kv.str2str[op.OpKey] = op.OpVal
-				} else if op.IsAppend {
-					kv.str2str[op.OpKey] += kv.str2str[op.OpKey] + op.OpVal
-				}
 				kv.px.Done(seqNum)
 				kv.mu.Unlock()
 				reply.Err = ""
@@ -203,6 +211,21 @@ func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 		}
 	}
 	return nil
+}
+
+func(kv *KVPaxos) applyOp(op Op) string {
+	fmt.Println("Apply op is called. op: ", op)
+	opReturn := ""
+	kv.mu.Lock()
+	if op.IsGet {
+		opReturn = kv.str2str[op.OpKey]
+	} else if op.IsAppend {
+		kv.str2str[op.OpKey] += op.OpVal
+	} else if op.IsPut {
+		kv.str2str[op.OpKey] = op.OpVal
+	}
+	kv.mu.Unlock()
+	return opReturn
 }
 
 // tell the server to shut itself down.

@@ -80,6 +80,7 @@ func (ck *Clerk) Get(key string) string {
 			break
 		}
 	}
+	fmt.Println("client | Done get: ", key, " ", args.ReqCode, " ", reply.Value)
 	return reply.Value
 }
 
@@ -102,6 +103,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			break
 		}
 	}
+	fmt.Println("client | Done Put Append: ", key, " ", args.ReqCode, " ", op)
 	return
 }
 

@@ -67,7 +67,7 @@ func TestBasic(t *testing.T) {
 	ck.Append("app", "x")
 	ck.Append("app", "y")
 	check(t, ck, "app", "xy")
-
+	fmt.Printf("Done First Check\n")
 	ck.Put("a", "aa")
 	check(t, ck, "a", "aa")
 
