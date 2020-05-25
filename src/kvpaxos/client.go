@@ -10,6 +10,8 @@ type Clerk struct {
 	servers []string
 	// You will have to modify this struct.
 	serverIdx int //record the server that you would like to contact
+	downCnt int
+	serverUp map[int]bool
 }
 
 func nrand() int64 {
@@ -24,6 +26,8 @@ func MakeClerk(servers []string) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.serverIdx = 0
+	ck.downCnt = 0
+	ck.serverUp = make(map[int]bool)
 	return ck
 }
 
@@ -75,12 +79,21 @@ func (ck *Clerk) Get(key string) string {
 	for {
 		ok := call(ck.servers[ck.serverIdx], "KVPaxos.Get", args, reply)
 		if ok == false || reply.Err != "" {
-			ck.serverIdx = (ck.serverIdx + 1) % len(ck.servers)
+			fmt.Println("Get | Switching server old addr: ", ck.servers[ck.serverIdx], "serverIdx: ", ck.serverIdx, "Server length: ", len(ck.servers))
+			if ok == false || reply.Err == "server is down" {
+				ck.serverUp[ck.serverIdx] = false
+				ck.serverIdx = (ck.serverIdx + 1) % len(ck.servers)
+				ck.downCnt += 1
+				if ck.downCnt >= len(ck.servers) {
+					return ""
+				}
+			}
+
 		} else {
 			break
 		}
 	}
-	fmt.Println("client | Done get: ", key, " ", args.ReqCode, " ", reply.Value)
+	fmt.Println("client | Done get: ", key, " ", args.ReqCode)
 	return reply.Value
 }
 
@@ -98,12 +111,20 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	for {
 		ok := call(ck.servers[ck.serverIdx], "KVPaxos.PutAppend", args, reply)
 		if ok == false || reply.Err != "" {
-			ck.serverIdx = (ck.serverIdx + 1) % len(ck.servers)
+			fmt.Println("PutAppend | Switching server old addr: ", ck.servers[ck.serverIdx], "serverIdx: ", ck.serverIdx)
+			if ok == false || reply.Err == "server is down"{
+				ck.serverUp[ck.serverIdx] = false
+				ck.serverIdx = (ck.serverIdx + 1) % len(ck.servers)
+				ck.downCnt += 1
+				if ck.downCnt >= len(ck.servers) {
+					return
+				}
+			}
 		} else {
 			break
 		}
 	}
-	fmt.Println("client | Done Put Append: ", key, " ", args.ReqCode, " ", op)
+	fmt.Println("client | Done Put Append: ", key, " ", args.ReqCode)
 	return
 }
 

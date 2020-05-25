@@ -62,6 +62,8 @@ type Paxos struct {
 	learnedVal map[int]interface{}
 	minSeq int
 	maxSeq int
+	timeOutCnt int
+	timeOutTime time.Duration
 }
 
 type LogVal struct {
@@ -240,7 +242,9 @@ func (px *Paxos) Start(seq int, v interface{}) {
 				if idx == px.me {
 					px.AcceptorPrepare(proposeArgs, proposalReply)
 				} else {
-					for i:= 0; (call(addr, "Paxos.AcceptorPrepare", proposeArgs, proposalReply) == false) && (i < 10) && px.isdead() == false; i++ {}
+					for i:= 0; (call(addr, "Paxos.AcceptorPrepare", proposeArgs, proposalReply) == false) && (i < px.timeOutCnt) && px.isdead() == false; i++ {
+						time.Sleep(px.timeOutTime * time.Millisecond)
+					}
 				}
 				// Update the highest accepted proposal number
 				if proposalReply.SeqNum != -1 && proposalReply.IsProposalNumHigh == true && proposalReply.AcceptedNum != -1 {
@@ -282,7 +286,9 @@ func (px *Paxos) Start(seq int, v interface{}) {
 						px.AcceptorAccept(acceptArgs, acceptReply)
 					} else {
 						//TODO::time.Sleep(1 * time.Second) can be used to avoid conjestion
-						for i:= 0; call(addr, "Paxos.AcceptorAccept", acceptArgs, acceptReply) == false && i < 10 && px.isdead() == false; i++ {}
+						for i:= 0; call(addr, "Paxos.AcceptorAccept", acceptArgs, acceptReply) == false && i < px.timeOutCnt && px.isdead() == false; i++ {
+							time.Sleep(px.timeOutTime * time.Millisecond)
+						}
 					}
 					if acceptReply.HasAccepted == true {
 						acceptPhaseCnt += 1
@@ -312,7 +318,9 @@ func (px *Paxos) BcastLearnedValue(seq int, v interface{}) {
 		if idx == px.me {
 			px.AcceptorDecided(acceptArgs, acceptReply)
 		} else {
-			for i := 0; i < 10 && px.isdead() == false && call(addr, "Paxos.AcceptorDecided", acceptArgs, acceptReply) == false; i++ {}// try to broadcast the value and give the maximum of 10 trial
+			for i := 0; i < px.timeOutCnt && px.isdead() == false && call(addr, "Paxos.AcceptorDecided", acceptArgs, acceptReply) == false; i++ {
+				time.Sleep(px.timeOutTime * time.Millisecond)
+			}// try to broadcast the value and give the maximum of 10 trial
 		}
 	}
 }
@@ -394,13 +402,14 @@ func (px *Paxos) Min() int {
 		} else {
 			getMinLocalArg := &GetMinLocalArg{}
 			getMinLocalReply := &GetMinLocalReply{}
-			for i:=0; i < 10 && px.isdead() == false; i++{
+			for i:=0; i < px.timeOutCnt && px.isdead() == false; i++{
 				isConnected := call(addr,"Paxos.GetMinLocal", getMinLocalArg, getMinLocalReply)
 				if isConnected == true {
 					minVal = minH(minVal, getMinLocalReply.MinSeq)
 					//fmt.Println("Testing Min | minVal: ", minVal)
 					break
 				}
+				time.Sleep(px.timeOutTime * time.Millisecond)
 			}
 		}
 	}
@@ -503,7 +512,9 @@ func (px *Paxos) learnerPropose(seq int) {
 				if idx == px.me {
 					px.LearnerLearn(learnerArgs, learnerReply)
 				} else {
-					for i := 0; i < 10 && px.isdead() == false && (call(addr, "Paxos.LearnerLearn", learnerArgs, learnerReply) == false); i++ {}
+					for i := 0; i < px.timeOutCnt && px.isdead() == false && (call(addr, "Paxos.LearnerLearn", learnerArgs, learnerReply) == false); i++ {
+						time.Sleep(px.timeOutTime * time.Millisecond)
+					}
 				}
 				if learnerReply.SeqNum == -1 || learnerReply.HasAccepted == false {
 					continue
@@ -560,6 +571,8 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px.learnedVal = make(map[int]interface{})
 	px.minSeq = -1
 	px.maxSeq = -1
+	px.timeOutCnt = 2
+	px.timeOutTime = 10
 	// end of my initialization
 	if rpcs != nil {
 		// caller will create socket &c

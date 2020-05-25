@@ -52,6 +52,7 @@ type KVPaxos struct {
 	seq		   int
 	str2str    map[string]string
 	reqHist    map[int64]bool
+	reqAvailable map[int64]string
 }
 
 
@@ -65,7 +66,13 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 	kv.mu.Lock()
 	if kv.reqHist[args.ReqCode] == true {
 		// Operation has been applied
-		reply.Err = ""
+		retVal, ok := kv.reqAvailable[args.ReqCode]
+		if ok == true {
+			reply.Err = ""
+			reply.Value = retVal
+		} else {
+			reply.Err = "Not ready"
+		}
 		kv.mu.Unlock()
 		return nil
 	}
@@ -79,7 +86,7 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 	isSettled := false
 	to := 10 * time.Millisecond
 
-	for isSettled == false {
+	for isSettled == false && kv.isdead() == false{
 		kv.mu.Lock()
 		seqNum := kv.seq
 		kv.px.Start(seqNum, op)
@@ -88,26 +95,29 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 		kv.mu.Unlock()
 		fmt.Println("Get | Started SeqNum: ", seqNum, " reqCode: ", args.ReqCode)
 		//check whether the server is deaded
-		if kv.isdead()== true {
+		if kv.isdead() == true {
 			reply.Err = "server is down"
 			return nil
 		}
-		for {
+		for kv.isdead() == false {
 			status, learnedVal := kv.px.Status(seqNum)
-			if status == paxos.Decided {
+			fmt.Println("Get | seqNum: ", seqNum, " status: ", status)
+			if status != paxos.Pending { // either decided or forgotten
 				learnedOp, _ := learnedVal.(Op)
-				if learnedOp.OpCode != op.OpCode {
+				if status == paxos.Forgotten || learnedOp.OpCode != op.OpCode {
 					// operation key avoid duplicated action
 					// The proposed sequence number proposed by you has not been accepted
 					// increase the sequence number
-					fmt.Print("catching up:")
-					kv.applyOp(learnedOp)
+					if status == paxos.Decided {
+						fmt.Print("catching up:")
+						kv.applyOp(learnedOp) //catching up the operation
+					}
 					break
 				}
 				//check all the previous ops
 				minSeq := kv.px.Min()
 				isReady := false
-				for isReady == false {
+				for isReady == false && kv.isdead() == false{
 					isReady = true
 					//check whether previous status has been accepted
 					for i := minSeq ; i < seqNum; i++ {
@@ -117,6 +127,10 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 						}
 					}
 				}
+				if kv.isdead() == true {
+					reply.Err = "server is down"
+					return nil
+				}
 				reply.Value = kv.applyOp(op)
 				kv.mu.Lock()
 				kv.px.Done(seqNum) //free the unused memory
@@ -124,11 +138,16 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 				reply.Err = ""
 				return nil
 			}
+			fmt.Println("Get | Putting to sleep")
 			time.Sleep(to)
 			if to < 10 * time.Second {
 				to *= 2
 			}
 		}
+	}
+	if kv.isdead() {
+		reply.Err = "server is down"
+		return nil
 	}
 	return nil
 }
@@ -158,7 +177,7 @@ func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 
 	isSettled := false
 	to := 10 * time.Millisecond
-	for isSettled == false {
+	for isSettled == false && kv.isdead() == false{
 		kv.mu.Lock()
 		seqNum := kv.seq
 		kv.px.Start(seqNum, op)
@@ -171,14 +190,17 @@ func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 			status, learnedVal := kv.px.Status(seqNum)
 			fmt.Println("PutAppend | seqNum: ", seqNum, " status: ", status)
 			if status != paxos.Pending { //either decided or forgotten
+				fmt.Println("PutAppend Seq: ", seqNum, " Not pending status")
 				learnedOp, _ := learnedVal.(Op)
 				if status == paxos.Forgotten || learnedOp.OpCode != op.OpCode {
 					// operation key avoid duplicated action
 					// The proposed sequence number proposed by you has not been accepted
 					// increase the sequence number
-					fmt.Print("catching up:")
 					if status == paxos.Decided {
+						fmt.Print("catching up:")
 						kv.applyOp(learnedOp) //catching up the operation
+					} else {
+						fmt.Println("Sequence ", seqNum," has been forgotten")
 					}
 					break
 				}
@@ -186,7 +208,7 @@ func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 				minSeq := kv.px.Min()
 				fmt.Println("current is Decided | minSeq: ", minSeq, " current Seq: ", seqNum)
 				isReady := false
-				for isReady == false {
+				for isReady == false && kv.isdead() == false{
 					isReady = true
 					//check whether previous status has been accepted
 					for i := minSeq ; i < seqNum; i++ {
@@ -196,6 +218,10 @@ func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 						}
 					}
 				}
+				if kv.isdead() {
+					reply.Err = "server is down"
+					return nil
+				}
 				fmt.Println("About to return from putAppend")
 				kv.applyOp(op)
 				kv.mu.Lock()
@@ -204,21 +230,32 @@ func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 				reply.Err = ""
 				return nil
 			}
+			fmt.Println("PutAppend | Putting to sleep")
 			time.Sleep(to)
 			if to < 10 * time.Second {
 				to *= 2
 			}
 		}
 	}
+	if kv.isdead() {
+		reply.Err = "server is down"
+		return nil
+	}
 	return nil
 }
 
 func(kv *KVPaxos) applyOp(op Op) string {
-	fmt.Println("Apply op is called. op: ", op)
+	fmt.Println("Apply op is called. opCode: ", op.OpCode)
 	opReturn := ""
+	ok := false
 	kv.mu.Lock()
 	if op.IsGet {
-		opReturn = kv.str2str[op.OpKey]
+		opReturn, ok= kv.str2str[op.OpKey]
+		if ok {
+			kv.reqAvailable[op.OpCode] = opReturn
+		} else {
+			kv.reqAvailable[op.OpCode] = ""
+		}
 	} else if op.IsAppend {
 		kv.str2str[op.OpKey] += op.OpVal
 	} else if op.IsPut {
@@ -272,6 +309,7 @@ func StartServer(servers []string, me int) *KVPaxos {
 	// Your initialization code here.
 	kv.str2str = make(map[string]string)
 	kv.reqHist = make(map[int64]bool)
+	kv.reqAvailable = make(map[int64]string)
 	kv.seq = 0
 	rpcs := rpc.NewServer()
 	rpcs.Register(kv)
